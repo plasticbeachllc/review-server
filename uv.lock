@@ -101,7 +101,7 @@ wheels = [
 ]
 
 [[package]]
-name = "claude-review-server"
+name = "review-server"
 version = "0.2.1"
 source = { virtual = "." }
 dependencies = [

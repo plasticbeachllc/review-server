@@ -269,7 +269,7 @@ def create_app(root: Path) -> dict:
     suffix = secrets.token_hex(3)
     manifest = {
         "name": f"pr-review-{owner}-{suffix}",
-        "url": "https://github.com/plasticbeachllc/claude-review-server",
+        "url": "https://github.com/plasticbeachllc/review-server",
         "hook_attributes": {
             # No "secret" key here — GitHub generates the webhook secret
             # automatically during the manifest flow and returns it in the

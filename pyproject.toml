@@ -1,5 +1,5 @@
 [project]
-name = "claude-review-server"
+name = "review-server"
 version = "0.2.1"
 requires-python = ">=3.10"
 dependencies = ["hcloud>=2.4", "requests>=2.28"]

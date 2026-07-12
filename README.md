@@ -80,8 +80,8 @@ The comment is the third field on each line (e.g. `ssh-ed25519 AAAA... Hetzner -
 ### Step 1: Clone and configure `.env`
 
 ```bash
-git clone https://github.com/plasticbeachllc/claude-review-server.git
-cd claude-review-server
+git clone https://github.com/plasticbeachllc/review-server.git
+cd review-server
 cp .env.example .env
 ```
 
