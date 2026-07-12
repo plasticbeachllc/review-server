@@ -24,6 +24,15 @@ deploy host:
     ssh {{host}} 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md && systemctl restart pr-review'
     @echo "✓ Deployed and restarted on {{host}}"
 
+# Log Codex in with ChatGPT/device auth as the review service user
+codex-login host:
+    ssh -t {{host}} 'install -d -m 700 -o review -g review /home/review/.codex && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex login --device-auth && systemctl restart pr-review'
+    @echo "✓ Codex login complete and pr-review restarted on {{host}}"
+
+# Smoke-test Codex as the review service user
+codex-smoke host:
+    ssh -n {{host}} 'cd /opt/pr-review && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex --sandbox read-only --ask-for-approval never exec --skip-git-repo-check --ignore-user-config --ignore-rules "Respond with exactly OK."'
+
 # Provision a new server (build + create + configure — fully automated)
 provision:
     uv run python scripts/provision.py

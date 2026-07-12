@@ -5,23 +5,9 @@
 # Source template — edit this file, then run: just build
 # The generated output (cloud-init.yaml) is gitignored.
 #
-# POST-PROVISION STEPS (do these manually after first boot):
-#   1. Set up a Cloudflare Tunnel pointing to http://localhost:80
-#      (see README for details)
-#
-#   2. Copy GitHub App credentials to the server:
-#        scp github-app.pem root@<ip>:/opt/pr-review/github-app.pem
-#        # Then add to /opt/pr-review/.env:
-#        #   GH_APP_ID=<from .env>
-#        #   GH_INSTALLATION_ID=<from .env>
-#        #   GH_APP_PRIVATE_KEY_FILE=/opt/pr-review/github-app.pem
-#        #   GITHUB_WEBHOOK_SECRET=<from .env>
-#
-#   3. Authenticate Claude Code:
-#        sudo -u review claude
-#
-#   4. Start the service:
-#        sudo systemctl start pr-review
+# This template prepares the base server. `just provision` then copies
+# agent.py/prompt.md, injects secrets, configures Cloudflare Tunnel/DNS,
+# and starts pr-review. For manual provisioning, see README.md.
 # ─────────────────────────────────────────────────────────────────
 
 package_update: true
@@ -36,6 +22,9 @@ packages:
   - debian-archive-keyring
   - apt-transport-https
   - curl
+  - bubblewrap
+  - apparmor-profiles
+  - apparmor-utils
 
 write_files:
   # ── Agent code (agent.py, prompt.md) is NOT embedded here ──
@@ -67,7 +56,7 @@ write_files:
       ProtectSystem=strict
       ReadWritePaths=/opt/pr-review /home/review
       PrivateTmp=yes
-      # gh config + Claude auth tokens live in ~review/
+      # gh config + Codex auth tokens live in ~review/
       ProtectHome=no
       ProtectKernelTunables=yes
       ProtectKernelModules=yes
@@ -83,27 +72,28 @@ write_files:
   # ── Caddy reverse proxy config (written in runcmd after caddy install) ──
 
 runcmd:
-  # ── Install Node.js (for Claude Code) ─────────────────────
-  # GPG key hash pinned to guard against supply-chain tampering between
-  # key download and package install.  Update the hash if NodeSource rotates
-  # their signing key (curl the URL and pipe through sha256sum).
+  # ── Install Codex CLI ─────────────────────────────────────
+  # Codex uses bubblewrap for Linux sandboxing. Ubuntu 24.04 may need the
+  # bwrap AppArmor profile loaded explicitly for unprivileged namespaces.
   - |
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource-repo.gpg.key
-    echo "b42e0321dabdc24e892115da705cf061167eac12a317f23d329862d0aa0a271d  /tmp/nodesource-repo.gpg.key" | sha256sum -c - \
-      || { echo "FATAL: NodeSource GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
-    gpg --yes --dearmor -o /usr/share/keyrings/nodesource.gpg /tmp/nodesource-repo.gpg.key
-    rm /tmp/nodesource-repo.gpg.key
-  # "nodistro" is NodeSource's intentional suite name (not a distro codename like jammy).
-  - echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
-  - apt-get update && apt-get install -y nodejs
-  - npm install -g @anthropic-ai/claude-code@2
-  - echo "Installed claude-code version:" && npm list -g @anthropic-ai/claude-code --depth=0
+    if [ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]; then
+      install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+      apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict || true
+    fi
+  - |
+    curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh
+    install -d -m 700 -o review -g review /home/review/.codex /home/review/.local/bin
+    cd /tmp
+    sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=/home/review/.local/bin sh /tmp/codex-install.sh
+    ln -sfn /home/review/.local/bin/codex /usr/local/bin/codex
+    rm /tmp/codex-install.sh
+  - echo "Installed Codex version:" && codex --version
 
   # ── Install GitHub CLI ────────────────────────────────────
-  # GPG key hash pinned (same rationale as NodeSource and Cloudflare above).
+  # GPG key hash pinned (same rationale as other vendor package keys).
   - |
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /tmp/githubcli-archive-keyring.gpg
-    echo "20e0125d6f6e077a9ad46f03371bc26d90b04939fb95170f5a1905099cc6bcc0  /tmp/githubcli-archive-keyring.gpg" | sha256sum -c - \
+    echo "6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b  /tmp/githubcli-archive-keyring.gpg" | sha256sum -c - \
       || { echo "FATAL: GitHub CLI GPG key hash mismatch — key may have been rotated; update hash in cloud-init.tmpl.yaml"; exit 1; }
     mv /tmp/githubcli-archive-keyring.gpg /usr/share/keyrings/githubcli-archive-keyring.gpg
     chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -111,7 +101,7 @@ runcmd:
   - apt-get update && apt-get install -y gh
 
   # ── Install Caddy ─────────────────────────────────────────
-  # GPG key hash pinned (same rationale as NodeSource and GitHub CLI above).
+  # GPG key hash pinned (same rationale as other vendor package keys).
   - |
     curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o /tmp/caddy-stable.gpg.key
     echo "783dfee04b19e851a928cd87b34710213ebbe7628f98d9f34595ab83be578c00  /tmp/caddy-stable.gpg.key" | sha256sum -c - \
@@ -151,16 +141,23 @@ runcmd:
   # ── Create service user ───────────────────────────────────
   - useradd -r -m -s /bin/bash review
 
+  # ── Set up directories ────────────────────────────────────
+  - mkdir -p /opt/pr-review/workspace
+
   # ── Write env file skeleton (secrets are injected by provision.py) ──
   - |
     {
       echo "REVIEW_WORKDIR=/opt/pr-review/workspace"
       echo "MAX_WORKERS=4"
       echo "PORT=8080"
+      echo "REVIEW_ENGINE=codex"
+      echo "CODEX_SANDBOX=read-only"
+      echo "CODEX_APPROVAL_POLICY=never"
+      echo "CODEX_WEB_SEARCH=disabled"
+      echo "CODEX_HOME=/home/review/.codex"
     } > /opt/pr-review/.env
 
-  # ── Set up directories and permissions ────────────────────
-  - mkdir -p /opt/pr-review/workspace
+  # ── Set permissions ───────────────────────────────────────
   - chown -R review:review /opt/pr-review
   - chmod 600 /opt/pr-review/.env
 
@@ -194,14 +191,14 @@ runcmd:
   - |
     echo ""
     echo "════════════════════════════════════════════════════════"
-    echo "  SETUP COMPLETE — manual steps remaining:"
+    echo "  BASE SERVER READY"
     echo ""
-    echo "  1. Set up Cloudflare Tunnel (see README)"
+    echo "  Automated provisioning will now:"
     echo ""
-    echo "  2. Inject credentials:"
-    echo "       Copy github-app.pem and set env vars (see README)"
-    echo "       Authenticate Claude: sudo -u review claude"
+    echo "  1. Copy agent.py and prompt.md"
+    echo "  2. Inject GitHub App config and Codex settings"
+    echo "  3. Configure Cloudflare Tunnel and DNS"
+    echo "  4. Start pr-review"
     echo ""
-    echo "  3. Start the agent:"
-    echo "       systemctl start pr-review"
+    echo "  For manual setup, follow README.md."
     echo "════════════════════════════════════════════════════════"

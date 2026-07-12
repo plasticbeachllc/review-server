@@ -2,7 +2,7 @@
 """Provision a Hetzner server with the PR review agent — fully automated.
 
 Reads configuration from .env, creates a server via the Hetzner API,
-waits for cloud-init, injects GitHub App credentials and Claude auth,
+waits for cloud-init, injects GitHub App credentials and reviewer config,
 sets up a Cloudflare Tunnel, and starts the service.
 
 Requires ``just create-app`` to have been run first (GitHub App + webhook
@@ -376,8 +376,38 @@ def deploy_agent_files(ip: str, root: Path):
     print("  Copied agent.py and prompt.md to server")
 
 
+def _maybe_login_codex(ip: str, config: dict):
+    """Seed Codex ChatGPT auth for the review user when configured.
+
+    CODEX_ACCESS_TOKEN is consumed over stdin and is not written to the
+    service env file. If absent, the user can run ``codex login`` manually
+    as the ``review`` user after provisioning.
+    """
+    if config.get("REVIEW_ENGINE", "codex").strip().lower() != "codex":
+        return
+
+    token = config.get("CODEX_ACCESS_TOKEN", "").strip()
+    if not token:
+        print("  Codex access token not set; run Codex login manually after provisioning")
+        return
+
+    print("  Seeding Codex login for review user...")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"root@{ip}",
+         "install -d -m 700 -o review -g review /home/review/.codex && "
+         "sudo -u review env CODEX_HOME=/home/review/.codex "
+         "codex login --with-access-token"],
+        input=token, capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise ProvisionError(
+            f"Codex login failed (rc={result.returncode})\n"
+            f"stderr: {result.stderr.strip()}"
+        )
+
+
 def inject_auth(ip: str, config: dict):
-    """Inject GitHub App credentials and Claude auth tokens into the server.
+    """Inject GitHub App credentials and reviewer configuration into the server.
 
     Copies the App private key PEM and upserts env vars into the service
     env file.  Uses stdin for all secret values to avoid process-arg exposure.
@@ -391,6 +421,14 @@ def inject_auth(ip: str, config: dict):
             f"GitHub CLI (gh) not found on server. "
             f"Check cloud-init logs: ssh root@{ip} cloud-init status --long"
         )
+    if config.get("REVIEW_ENGINE", "codex").strip().lower() == "codex":
+        try:
+            ssh(ip, "command -v codex", timeout=10, label="check codex installed")
+        except ProvisionError:
+            raise ProvisionError(
+                f"Codex CLI not found on server. "
+                f"Check cloud-init logs: ssh root@{ip} cloud-init status --long"
+            )
 
     # Copy GitHub App private key to the server
     print("  Injecting GitHub App private key...")
@@ -420,12 +458,25 @@ def inject_auth(ip: str, config: dict):
     _upsert_env_var(ip, "GITHUB_WEBHOOK_SECRET", config["GITHUB_WEBHOOK_SECRET"],
                     label="GITHUB_WEBHOOK_SECRET")
 
-    # Claude Code auth — upsert token in the service env file.
-    # Token is piped via stdin into a shell variable so it never appears in
-    # process args (/proc/*/cmdline).
-    print("  Injecting Claude Code OAuth token...")
-    _upsert_env_var(ip, "CLAUDE_CODE_OAUTH_TOKEN", config["CLAUDE_CODE_OAUTH_TOKEN"],
-                    label="CLAUDE_CODE_OAUTH_TOKEN")
+    # Reviewer configuration. CODEX_ACCESS_TOKEN is intentionally excluded:
+    # if present, it is consumed once by _maybe_login_codex and never stored
+    # in the service env file where untrusted review prompts could reach it.
+    print("  Injecting reviewer configuration...")
+    for key in (
+        "REVIEW_ENGINE",
+        "CODEX_MODEL",
+        "CODEX_SANDBOX",
+        "CODEX_APPROVAL_POLICY",
+        "CODEX_TIMEOUT_SECONDS",
+        "CODEX_WEB_SEARCH",
+        "CODEX_EPHEMERAL",
+        "CODEX_IGNORE_USER_CONFIG",
+        "CODEX_IGNORE_RULES",
+    ):
+        if config.get(key):
+            _upsert_env_var(ip, key, config[key])
+
+    _maybe_login_codex(ip, config)
 
 
 # ---------------------------------------------------------------------------

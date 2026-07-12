@@ -1,18 +1,18 @@
-# Claude Review Server
+# PR Review Server
 
-A self-hosted agent that automatically reviews pull requests using your Claude Code subscription. When a PR is opened or updated on your GitHub account (org or personal), the agent posts a concise, actionable review comment. Force-pushes automatically collapse old reviews so the conversation stays clean.
+A self-hosted agent that automatically reviews pull requests using Codex CLI with your ChatGPT subscription. When a PR is opened or updated on your GitHub account (org or personal), the agent posts a concise, actionable review comment. Force-pushes automatically collapse old reviews so the conversation stays clean.
 
 ```
-GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Claude Code → PR comment
+GitHub webhook → Cloudflare Tunnel → Caddy → Python agent → Codex CLI → PR comment
 ```
 
 ---
 
 ## Why this exists
 
-|  | Claude Review Server | GitHub Copilot code review | Typical SaaS reviewers |
+|  | PR Review Server | GitHub Copilot code review | Typical SaaS reviewers |
 |--|--|--|--|
-| **Cost** | ~$4/mo server + your existing Claude sub | $19/user/mo or higher | $15–50/user/mo |
+| **Cost** | ~$4/mo server + your existing ChatGPT/Codex access | $19/user/mo or higher | $15–50/user/mo |
 | **Privacy** | Code stays on your server | Sent to GitHub/Microsoft | Sent to third party |
 | **Customizable** | Edit one Markdown file to change the review focus | Limited configuration | Varies |
 | **Self-hosted** | Full control | No | Rarely |
@@ -34,7 +34,7 @@ You also need accounts with:
 - [**Cloudflare**](https://dash.cloudflare.com/) (tunnel + DNS, free tier works)
 - A **domain name** managed by Cloudflare DNS — cheap TLDs like `.xyz` or `.click` work fine (~$2/year via [Cloudflare Registrar](https://www.cloudflare.com/products/registrar/))
 - [**GitHub**](https://github.com/) account (org or personal) with admin access (to create and install a GitHub App)
-- A **Claude Code subscription** (Pro or Max)
+- A **ChatGPT subscription with Codex access**
 
 ### SSH key setup
 
@@ -85,7 +85,7 @@ cd claude-review-server
 cp .env.example .env
 ```
 
-Open `.env` in your editor. You need to fill in **7 values** — the rest are defaults or auto-populated later.
+Open `.env` in your editor. You need to fill in **6 values** — the rest are defaults or auto-populated later.
 
 #### `HCLOUD_TOKEN`
 
@@ -94,10 +94,6 @@ Open `.env` in your editor. You need to fill in **7 values** — the rest are de
 3. Left sidebar → **Security** → **API Tokens**
 4. Click **Generate API Token**, name it anything, select **Read & Write**
 5. Copy the token — it's only shown once
-
-#### `CLAUDE_CODE_OAUTH_TOKEN`
-
-Run `claude setup-token` locally, follow the prompts, and copy the resulting token into `.env`.
 
 #### `CF_API_TOKEN`
 
@@ -124,6 +120,15 @@ A subdomain of the domain you selected above, e.g. `pr-review.example.com`.
 
 Your GitHub org or username as it appears in the URL (`github.com/my-org` → `my-org`).
 
+#### Codex ChatGPT authentication
+
+Do **not** set an OpenAI API key for this harness if you want reviews to use your ChatGPT subscription.
+
+There are two supported ChatGPT-backed paths:
+
+1. **Device login after provisioning**: leave `CODEX_ACCESS_TOKEN` unset, run `just provision`, then run `just codex-login root@<server-ip>` and complete the device-code login in your browser.
+2. **Codex access token during provisioning**: if your ChatGPT workspace supports Codex access tokens, set `CODEX_ACCESS_TOKEN` locally in `.env`. Provisioning consumes it once with `codex login --with-access-token` for the `review` user and does not store it in `/opt/pr-review/.env`.
+
 <details>
 <summary>What your <code>.env</code> should look like after this step</summary>
 
@@ -146,8 +151,12 @@ GH_APP_PRIVATE_KEY_FILE=github-app.pem            # ← auto-populated in Step 2
 GH_INSTALLATION_ID=                               # ← auto-populated in Step 2
 GITHUB_WEBHOOK_SECRET=                            # ← auto-populated in Step 2
 
-# ── Claude Code ──────────────────────────────────
-CLAUDE_CODE_OAUTH_TOKEN=eyJhb...                   # ← you filled this in
+# ── Codex reviewer ───────────────────────────────
+REVIEW_ENGINE=codex                                # leave as-is
+CODEX_SANDBOX=read-only                            # leave as-is
+CODEX_APPROVAL_POLICY=never                        # leave as-is
+CODEX_WEB_SEARCH=disabled                          # leave as-is
+# CODEX_ACCESS_TOKEN=                              # optional one-time login seed
 
 # ── Cloudflare ───────────────────────────────────
 CF_API_TOKEN=aBcDeFgHiJkLmNoPqRsTuVwXyZ...       # ← you filled this in
@@ -193,7 +202,19 @@ When it finishes, you'll see:
 ══════════════════════════════════════════════════════════════
 ```
 
-### Step 4: Verify it works
+### Step 4: Log Codex in and verify it works
+
+If you did not set `CODEX_ACCESS_TOKEN` before provisioning, log Codex in with your ChatGPT subscription:
+
+```bash
+just codex-login root@<server-ip>
+```
+
+Follow the device-code instructions in your browser. Then smoke-test Codex as the service user:
+
+```bash
+just codex-smoke root@<server-ip>
+```
 
 ```bash
 just status
@@ -221,23 +242,18 @@ ssh root@<server-ip> journalctl -u pr-review -f   # tail logs
 
 Find your server IP in the `just provision` output or via `just status`.
 
-### Claude Code version
+### Codex CLI version
 
-The server installs `@anthropic-ai/claude-code@2` (pinned to the major version). To update to a new major version or pin to an exact release:
-
-1. Edit the version in `infra/cloud-init.tmpl.yaml` (search for `claude-code@`)
-2. Re-provision: `just destroy yes && just provision`
-
-To update on a running server without re-provisioning:
+The server installs Codex CLI with the official non-interactive installer. To update on a running server:
 
 ```bash
-ssh root@<server-ip> npm install -g @anthropic-ai/claude-code@2
+ssh root@<server-ip> CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=/usr/local/bin sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'
 ssh root@<server-ip> systemctl restart pr-review
 ```
 
 ### GPG signing keys
 
-Provisioning pins the SHA-256 hashes of vendor GPG keys (NodeSource, GitHub CLI, Cloudflare) to guard against supply-chain tampering. If a vendor rotates their key, provisioning will fail with a clear error. To update a hash:
+Provisioning pins the SHA-256 hashes of vendor GPG keys (GitHub CLI, Caddy, Cloudflare) to guard against supply-chain tampering. If a vendor rotates their key, provisioning will fail with a clear error. To update a hash:
 
 ```bash
 curl -fsSL <key-url> | sha256sum
@@ -247,8 +263,8 @@ Replace the old hash in `infra/cloud-init.tmpl.yaml` and update the reference in
 
 | Vendor | Key URL |
 |--------|---------|
-| NodeSource | `https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key` |
 | GitHub CLI | `https://cli.github.com/packages/githubcli-archive-keyring.gpg` |
+| Caddy | `https://dl.cloudsmith.io/public/caddy/stable/gpg.key` |
 | Cloudflare | `https://pkg.cloudflare.com/cloudflare-main.gpg` |
 
 ---
@@ -269,16 +285,16 @@ Verify: `just status` should exit with code 3. To reprovision from scratch: `jus
 
 1. **Webhook received** — GitHub sends a PR event; the agent verifies the HMAC-SHA256 signature and skips drafts
 2. **Context gathered** — fetches the diff via `gh` CLI and full file contents via the GitHub API; large PRs are smart-truncated (lockfiles, generated code, and vendor files dropped first, largest files first)
-3. **Review posted** — Claude Code reviews the diff using a customizable prompt and posts a comment within 1–2 minutes
+3. **Review posted** — Codex CLI reviews the diff using a customizable prompt and posts a comment within 1–2 minutes
 4. **Force-push handling** — prior reviews are collapsed under a `<details>` tag; in-flight reviews are restarted
 
 ---
 
 ## Customization
 
-### Change what Claude reviews
+### Change what Codex reviews
 
-Edit `src/prompt.md`. This is the prompt template sent to Claude for each review.
+Edit `src/prompt.md`. This is the prompt template sent to Codex for each review.
 
 Available template variables: `{pr_number}`, `{repo}`, `{pr_title}`, `{pr_body}`, `{truncation_note}`, `{file_contents}`, `{diff}`.
 
@@ -335,6 +351,8 @@ Justfile                 # All commands: build, test, deploy, provision, destroy
 | `just provision` | Create server + tunnel (fully automated) |
 | `just status` | Check server health and status |
 | `just deploy root@host` | Push code changes to a running server |
+| `just codex-login root@host` | Log Codex in with ChatGPT device auth as the review user |
+| `just codex-smoke root@host` | Smoke-test Codex as the review user |
 | `just build` | Assemble cloud-init.yaml from template |
 | `just validate` | Build + validate cloud-init.yaml schema (requires `cloud-init` CLI) |
 | `just test` | Run unit tests |
@@ -401,7 +419,13 @@ ssh root@<server-ip>
 #   GH_INSTALLATION_ID=<from .env>
 #   GH_APP_PRIVATE_KEY_FILE=/opt/pr-review/github-app.pem
 #   GITHUB_WEBHOOK_SECRET=<from .env>
-#   CLAUDE_CODE_OAUTH_TOKEN=<from .env>
+#   REVIEW_ENGINE=codex
+#   CODEX_SANDBOX=read-only
+#   CODEX_APPROVAL_POLICY=never
+#   CODEX_WEB_SEARCH=disabled
+
+# Log Codex in as the review user:
+sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex login --device-auth
 
 # Fix permissions
 chown review:review /opt/pr-review/github-app.pem
@@ -441,7 +465,7 @@ Open a PR. You should see a review comment within 1–2 minutes.
 |---------|-----|
 | Webhook returns 404 | The agent only responds to `POST /webhook` and `GET /health` |
 | Agent won't start | `journalctl -u pr-review --no-pager -n 30` — usually a missing env var |
-| Claude auth errors | SSH into the server, run `sudo -u review claude` to re-authenticate, then `systemctl restart pr-review` |
+| Codex auth errors | Run `just codex-login root@<server-ip>` to re-authenticate, then `just codex-smoke root@<server-ip>` |
 | Reviews aren't posting | Check App credentials in `/opt/pr-review/.env` and PEM file permissions |
 | Tunnel not connecting | `systemctl status cloudflared` and check Cloudflare Zero Trust dashboard |
 
@@ -453,7 +477,7 @@ Open a PR. You should see a review comment within 1–2 minutes.
 - **HMAC signature verification** — every webhook payload is cryptographically verified
 - **Isolated service user** — the agent runs as an unprivileged `review` user, not root
 - **Systemd hardening** — `ProtectSystem=strict`, `PrivateTmp=yes`, restricted capabilities
-- **Token isolation** — auth tokens are stored with proper permissions in `~review/.claude/`
+- **Token isolation** — GitHub App credentials and Codex login state are stored in root-owned/review-owned files with restrictive permissions; Codex review subprocesses run with a sanitized environment
 
 ---
 

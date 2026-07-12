@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub PR Review Agent — webhook listener + Claude CLI reviewer."""
+"""GitHub PR Review Agent — webhook listener + CLI reviewer."""
 
 import base64
 import hashlib
@@ -62,9 +62,23 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
 DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "10"))
 REVIEW_MARKER = "<!-- claude-review -->"
+REVIEW_ENGINE = os.environ.get("REVIEW_ENGINE", "codex").strip().lower()
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "").strip()
+CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "read-only").strip()
+CODEX_APPROVAL_POLICY = os.environ.get("CODEX_APPROVAL_POLICY", "never").strip()
+CODEX_TIMEOUT_SECONDS = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "300"))
+CODEX_WEB_SEARCH = os.environ.get("CODEX_WEB_SEARCH", "disabled").strip()
+CODEX_HOME = os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+CODEX_EPHEMERAL = os.environ.get("CODEX_EPHEMERAL", "1").lower() not in ("0", "false", "no")
+CODEX_IGNORE_USER_CONFIG = os.environ.get("CODEX_IGNORE_USER_CONFIG", "1").lower() not in ("0", "false", "no")
+CODEX_IGNORE_RULES = os.environ.get("CODEX_IGNORE_RULES", "1").lower() not in ("0", "false", "no")
+CLAUDE_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
 SCRIPT_DIR = Path(__file__).resolve().parent
 _prompt_template: str | None = None
 _prompt_lock = threading.Lock()
+
+if REVIEW_ENGINE not in ("codex", "claude"):
+    sys.exit("REVIEW_ENGINE must be 'codex' or 'claude'")
 
 
 # ── GitHub App token management ──────────────────────────
@@ -238,7 +252,7 @@ def _bump_generation(pr_key: str) -> int:
     """Increment the generation counter for a PR.
 
     Cancels any pending debounce timer and sends SIGTERM to any running
-    Claude process.  We intentionally do NOT call proc.wait() here —
+    reviewer process.  We intentionally do NOT call proc.wait() here —
     the communicate() call in review_pr is the single authoritative wait.
     """
     with _review_state_lock:
@@ -538,6 +552,76 @@ def collapse_old_reviews(repo: str, pr_number: int):
         )
 
 
+def _reviewer_label() -> str:
+    """Human-readable label for posted comments and logs."""
+    return "Codex" if REVIEW_ENGINE == "codex" else "Claude Code"
+
+
+def _codex_command(prompt: str) -> list[str]:
+    """Build a non-interactive Codex review command.
+
+    The prompt is passed as a positional argument, not through shell
+    interpolation.
+    """
+    cmd = [
+        "codex",
+        "--sandbox", CODEX_SANDBOX,
+        "--ask-for-approval", CODEX_APPROVAL_POLICY,
+        "exec",
+        "--skip-git-repo-check",
+        "-c", f'web_search="{CODEX_WEB_SEARCH}"',
+    ]
+    if CODEX_EPHEMERAL:
+        cmd.append("--ephemeral")
+    if CODEX_IGNORE_USER_CONFIG:
+        cmd.append("--ignore-user-config")
+    if CODEX_IGNORE_RULES:
+        cmd.append("--ignore-rules")
+    if CODEX_MODEL:
+        cmd.extend(["--model", CODEX_MODEL])
+    cmd.append(prompt)
+    return cmd
+
+
+def _reviewer_command(prompt: str) -> list[str]:
+    """Build the configured reviewer CLI command."""
+    if REVIEW_ENGINE == "codex":
+        return _codex_command(prompt)
+    return ["claude", "-p", prompt, "--output-format", "text"]
+
+
+def _reviewer_timeout_seconds() -> int:
+    """Return timeout for the configured reviewer."""
+    if REVIEW_ENGINE == "codex":
+        return CODEX_TIMEOUT_SECONDS
+    return CLAUDE_TIMEOUT_SECONDS
+
+
+def _reviewer_env() -> dict[str, str]:
+    """Return a minimal environment for reviewer subprocesses.
+
+    Codex reviews untrusted PR content. Do not pass GitHub App secrets,
+    webhook secrets, or one-shot automation tokens into that process.
+    Persistent Codex login should live in CODEX_HOME for the review user.
+    """
+    if REVIEW_ENGINE == "claude":
+        return os.environ.copy()
+
+    keep = (
+        "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+    )
+    env = {k: v for k, v in os.environ.items() if k in keep}
+    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    env.setdefault("HOME", str(Path(CODEX_HOME).parent))
+    env["CODEX_HOME"] = CODEX_HOME
+    env.pop("CODEX_API_KEY", None)
+    env.pop("CODEX_ACCESS_TOKEN", None)
+    return env
+
+
 def review_pr(
     repo: str,
     pr_number: int,
@@ -546,7 +630,7 @@ def review_pr(
     pr_key: str,
     generation: int,
 ):
-    """Fetch diff, invoke Claude, post review comment.
+    """Fetch diff, invoke the configured reviewer, post review comment.
 
     Bails out early if a newer generation supersedes this one (i.e. a new
     push arrived while we were working).
@@ -644,16 +728,19 @@ def review_pr(
         # Collapse runs of blank lines left by empty placeholders
         prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
-        # ── Check before Claude invocation (the expensive step) ──
+        reviewer = _reviewer_label()
+
+        # ── Check before reviewer invocation (the expensive step) ──
         if not _is_current(pr_key, generation):
-            log.info(f"Superseded before Claude call {pr_key} gen={generation}")
+            log.info(f"Superseded before {reviewer} call {pr_key} gen={generation}")
             return
 
         # Use Popen so the webhook handler can kill us mid-flight.
         proc = subprocess.Popen(
-            ["claude", "-p", prompt, "--output-format", "text"],
+            _reviewer_command(prompt),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=str(WORKDIR),
+            stdin=subprocess.DEVNULL,
+            cwd=str(WORKDIR), env=_reviewer_env(),
         )
 
         # Register process so _bump_generation can kill it.
@@ -668,11 +755,11 @@ def review_pr(
                 return
 
         try:
-            stdout, stderr = proc.communicate(timeout=300)
+            stdout, stderr = proc.communicate(timeout=_reviewer_timeout_seconds())
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            log.error(f"Claude timed out for {pr_key}")
+            log.error(f"{reviewer} timed out for {pr_key}")
             return
         finally:
             # Unregister process handle.
@@ -684,9 +771,9 @@ def review_pr(
         if proc.returncode != 0:
             # returncode < 0 means killed by signal (i.e. we cancelled it).
             if proc.returncode < 0:
-                log.info(f"Claude killed (signal {-proc.returncode}) for {pr_key}")
+                log.info(f"{reviewer} killed (signal {-proc.returncode}) for {pr_key}")
                 return
-            log.error(f"claude failed (exit {proc.returncode}): {stderr}")
+            log.error(f"{REVIEW_ENGINE} failed (exit {proc.returncode}): {stderr}")
             return
 
         review_text = stdout.strip()
@@ -700,7 +787,7 @@ def review_pr(
             return
 
         header = "🔄 Updated Review" if action == "synchronize" else "📝 Review"
-        footer = "\n\n---\n*Automated review by Claude Code*"
+        footer = f"\n\n---\n*Automated review by {_reviewer_label()}*"
 
         # Truncate if review would exceed GitHub's comment size limit
         overhead = len(f"{REVIEW_MARKER}\n## {header}\n\n") + len(footer)

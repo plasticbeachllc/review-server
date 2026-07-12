@@ -43,6 +43,9 @@ from agent import (
     _gh_env,
     _is_current,
     _PRReviewState,
+    _codex_command,
+    _reviewer_command,
+    _reviewer_env,
     _review_state,
     _review_state_lock,
     _schedule_review,
@@ -143,6 +146,44 @@ class TestInstallationToken:
             with _token_lock:
                 _token_cache.token = ""
                 _token_cache.expires_at = 0.0
+
+
+class TestReviewerCommand:
+    def test_codex_command_uses_noninteractive_read_only_defaults(self):
+        cmd = _codex_command("Review this")
+        assert cmd[0] == "codex"
+        assert "exec" in cmd
+        assert cmd.index("--sandbox") < cmd.index("exec")
+        assert cmd.index("--ask-for-approval") < cmd.index("exec")
+        assert "--skip-git-repo-check" in cmd
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+        assert cmd[cmd.index("--ask-for-approval") + 1] == "never"
+        assert "web_search=\"disabled\"" in cmd
+        assert cmd[-1] == "Review this"
+
+    def test_reviewer_command_defaults_to_codex(self):
+        cmd = _reviewer_command("Review")
+        assert cmd[0] == "codex"
+        assert "exec" in cmd
+
+    def test_codex_env_strips_review_server_secrets(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "whsec")
+        monkeypatch.setenv("GH_APP_ID", "123")
+        monkeypatch.setenv("GH_INSTALLATION_ID", "456")
+        monkeypatch.setenv("GH_APP_PRIVATE_KEY_FILE", "/secret.pem")
+        monkeypatch.setenv("CODEX_ACCESS_TOKEN", "codex-access")
+        monkeypatch.setenv("CODEX_API_KEY", "codex-api")
+
+        env = _reviewer_env()
+
+        assert "PATH" in env
+        assert "CODEX_HOME" in env
+        assert "GITHUB_WEBHOOK_SECRET" not in env
+        assert "GH_APP_ID" not in env
+        assert "GH_INSTALLATION_ID" not in env
+        assert "GH_APP_PRIVATE_KEY_FILE" not in env
+        assert "CODEX_ACCESS_TOKEN" not in env
+        assert "CODEX_API_KEY" not in env
 
 
 # ── verify_signature ─────────────────────────────────────
@@ -971,7 +1012,7 @@ class TestReviewPr:
         gen = _bump_generation(pr_key)
         review_pr(repo, pr_number, title, action, pr_key, gen)
 
-    def _mock_claude(self, stdout="LGTM", returncode=0):
+    def _mock_reviewer(self, stdout="LGTM", returncode=0):
         proc = MagicMock()
         proc.communicate.return_value = (stdout, "")
         proc.returncode = returncode
@@ -991,11 +1032,11 @@ class TestReviewPr:
             # gh pr comment
             _subprocess_result(stdout="https://github.com/owner/repo/pull/1#comment"),
         ]
-        mock_popen.return_value = self._mock_claude("LGTM, no issues found.")
+        mock_popen.return_value = self._mock_reviewer("LGTM, no issues found.")
 
         self._call_review("owner/repo", 1, "Fix bug", "opened")
 
-        # Verify claude was called with the prompt
+        # Verify reviewer was called with the prompt
         mock_popen.assert_called_once()
         # Verify comment was posted
         assert mock_run.call_count == 4
@@ -1025,7 +1066,7 @@ class TestReviewPr:
             # gh pr comment
             _subprocess_result(stdout="https://github.com/owner/repo/pull/1#comment"),
         ]
-        mock_popen.return_value = self._mock_claude("Looks good.")
+        mock_popen.return_value = self._mock_reviewer("Looks good.")
 
         self._call_review("owner/repo", 1, "Fix bug", "ready_for_review")
 
@@ -1048,7 +1089,7 @@ class TestReviewPr:
             # gh pr comment
             _subprocess_result(),
         ]
-        mock_popen.return_value = self._mock_claude("Looks good.")
+        mock_popen.return_value = self._mock_reviewer("Looks good.")
 
         self._call_review("owner/repo", 2, "Update feature", "synchronize")
 
@@ -1072,7 +1113,7 @@ class TestReviewPr:
 
         self._call_review("owner/repo", 1, "Fix", "opened")
 
-        # Should stop after diff failure — no claude or comment calls
+        # Should stop after diff failure — no reviewer or comment calls
         assert mock_run.call_count == 2
 
     @patch("agent.subprocess.run")
@@ -1086,19 +1127,19 @@ class TestReviewPr:
 
         self._call_review("owner/repo", 1, "Empty PR", "opened")
 
-        # Should stop after detecting empty diff — no claude or comment calls
+        # Should stop after detecting empty diff — no reviewer or comment calls
         assert mock_run.call_count == 3
 
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
-    def test_returns_on_claude_failure(self, mock_template, mock_run, mock_popen):
+    def test_returns_on_reviewer_failure(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),                           # already_reviewed
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),   # diff
             _subprocess_result(stdout='{"body":"body"}\n'),            # pr info
         ]
-        mock_popen.return_value = self._mock_claude("", returncode=1)
+        mock_popen.return_value = self._mock_reviewer("", returncode=1)
 
         self._call_review("owner/repo", 1, "Fix", "opened")
 
@@ -1108,13 +1149,13 @@ class TestReviewPr:
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
-    def test_returns_on_empty_claude_output(self, mock_template, mock_run, mock_popen):
+    def test_returns_on_empty_reviewer_output(self, mock_template, mock_run, mock_popen):
         mock_run.side_effect = [
             _subprocess_result(stdout="0\n"),                           # already_reviewed
             _subprocess_result(stdout="diff --git a/x b/x\n+ok\n"),   # diff
             _subprocess_result(stdout='{"body":"body"}\n'),            # pr info
         ]
-        mock_popen.return_value = self._mock_claude("   \n")
+        mock_popen.return_value = self._mock_reviewer("   \n")
 
         self._call_review("owner/repo", 1, "Fix", "opened")
 
@@ -1130,7 +1171,7 @@ class TestReviewPr:
             _subprocess_result(stdout='{"body":"body"}\n'),            # pr info
             _subprocess_result(returncode=1, stderr="post failed"),    # comment fails
         ]
-        mock_popen.return_value = self._mock_claude("Review text")
+        mock_popen.return_value = self._mock_reviewer("Review text")
 
         # Should not raise
         self._call_review("owner/repo", 1, "Fix", "opened")
@@ -1158,12 +1199,12 @@ class TestReviewPr:
             _subprocess_result(stdout='{"body":"body with {braces}"}\n'),
             _subprocess_result(),  # comment
         ]
-        mock_popen.return_value = self._mock_claude("Review output")
+        mock_popen.return_value = self._mock_reviewer("Review output")
 
         # Title with braces should not cause a KeyError in .format()
         self._call_review("owner/repo", 1, "Fix {something}", "opened")
 
-        # Verify claude was called (format didn't crash)
+        # Verify reviewer was called (format didn't crash)
         mock_popen.assert_called_once()
 
     @patch("agent.subprocess.Popen")
@@ -1176,7 +1217,7 @@ class TestReviewPr:
             _subprocess_result(stdout='{"body":"body"}\n'),
             _subprocess_result(),  # comment
         ]
-        mock_popen.return_value = self._mock_claude("Review")
+        mock_popen.return_value = self._mock_reviewer("Review")
 
         self._call_review("owner/repo", 1, "Fix", "opened")
 
@@ -1197,11 +1238,11 @@ class TestReviewPr:
             _subprocess_result(returncode=1, stderr="err"),            # body fetch fails
             _subprocess_result(),                                      # comment
         ]
-        mock_popen.return_value = self._mock_claude("Review")
+        mock_popen.return_value = self._mock_reviewer("Review")
 
         self._call_review("owner/repo", 1, "Fix", "opened")
 
-        # Claude should still be called — body defaults to ""
+        # Reviewer should still be called — body defaults to ""
         mock_popen.assert_called_once()
 
 
@@ -1634,7 +1675,7 @@ class TestReviewPrCancellation:
     @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    def test_skips_claude_when_superseded_after_diff(self, mock_run, mock_popen, _mock_tpl):
+    def test_skips_reviewer_when_superseded_after_diff(self, mock_run, mock_popen, _mock_tpl):
         pr_key = "org/repo#51"
         gen = _bump_generation(pr_key)
 
@@ -1645,8 +1686,8 @@ class TestReviewPrCancellation:
             self._mock_body(),  # body
         ]
 
-        # Supersede after diff fetch but before Claude. We do this by making
-        # _is_current return False on the second call (before Claude).
+        # Supersede after diff fetch but before reviewer. We do this by making
+        # _is_current return False on the second call (before reviewer).
         call_count = 0
 
         def fake_is_current(key, g):
@@ -1654,7 +1695,7 @@ class TestReviewPrCancellation:
             call_count += 1
             if call_count == 1:
                 return True  # pass the first check (before start)
-            return False  # fail the second check (before Claude)
+            return False  # fail the second check (before reviewer)
 
         with patch("agent._is_current", side_effect=fake_is_current):
             review_pr("org/repo", 51, "title", "synchronize", pr_key, gen)
@@ -1664,7 +1705,7 @@ class TestReviewPrCancellation:
     @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    def test_skips_posting_when_superseded_after_claude(self, mock_run, mock_popen, _mock_tpl):
+    def test_skips_posting_when_superseded_after_reviewer(self, mock_run, mock_popen, _mock_tpl):
         pr_key = "org/repo#52"
         gen = _bump_generation(pr_key)
 
@@ -1685,7 +1726,7 @@ class TestReviewPrCancellation:
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
-                return True  # pass checks before start and before Claude
+                return True  # pass checks before start and before reviewer
             return False  # fail the check before posting
 
         with patch("agent._is_current", side_effect=fake_is_current):
@@ -1700,8 +1741,8 @@ class TestReviewPrCancellation:
     @patch("agent.get_prompt_template", return_value="{pr_number}{repo}{pr_title}{pr_body}{truncation_note}{file_contents}{diff}")
     @patch("agent.subprocess.Popen")
     @patch("agent.subprocess.run")
-    def test_handles_killed_claude_process(self, mock_run, mock_popen, _mock_tpl):
-        """When Claude is killed by signal, review_pr logs and exits cleanly."""
+    def test_handles_killed_reviewer_process(self, mock_run, mock_popen, _mock_tpl):
+        """When reviewer is killed by signal, review_pr logs and exits cleanly."""
         pr_key = "org/repo#53"
         gen = _bump_generation(pr_key)
 

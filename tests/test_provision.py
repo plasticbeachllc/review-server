@@ -24,7 +24,6 @@ class TestLoadConfig:
             "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
             "GH_INSTALLATION_ID": "67890",
             "GITHUB_WEBHOOK_SECRET": "whsec_test",
-            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test",
             "CF_API_TOKEN": "cf-test-token",
             "CF_ACCOUNT_ID": "cf-account-123",
             "CF_ZONE_ID": "cf-zone-456",
@@ -746,7 +745,6 @@ class TestInjectAuth:
             "GH_INSTALLATION_ID": "67890",
             "GH_APP_PRIVATE_KEY_FILE": "github-app.pem",
             "GITHUB_WEBHOOK_SECRET": "whsec_test",
-            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test",
         }
         if tmp_path:
             pem = tmp_path / "github-app.pem"
@@ -770,6 +768,19 @@ class TestInjectAuth:
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
+    def test_raises_when_codex_not_installed(self, mock_ssh, mock_run):
+        from _common import ProvisionError
+        from provision import inject_auth
+
+        mock_ssh.side_effect = ["/usr/bin/gh", ProvisionError("command not found")]
+
+        with pytest.raises(ProvisionError, match="Codex CLI.*not found"):
+            inject_auth("1.2.3.4", self._config())
+
+        mock_run.assert_not_called()
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
     def test_raises_on_pem_injection_failure(self, mock_ssh, mock_run, tmp_path):
         from _common import ProvisionError
         from provision import inject_auth
@@ -789,14 +800,14 @@ class TestInjectAuth:
         from provision import inject_auth
 
         mock_ssh.return_value = "/usr/bin/gh"
-        # 6 subprocess.run calls: PEM copy + 4 env vars + Claude token
+        # 5 subprocess.run calls: PEM copy + 4 GitHub App env vars
         mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
         inject_auth("1.2.3.4", self._config(tmp_path))  # should not raise
 
         # 1 PEM copy + 4 env var upserts (GH_APP_ID, GH_INSTALLATION_ID,
-        # GH_APP_PRIVATE_KEY_FILE, GITHUB_WEBHOOK_SECRET) + 1 Claude token
-        assert mock_run.call_count == 6
+        # GH_APP_PRIVATE_KEY_FILE, GITHUB_WEBHOOK_SECRET)
+        assert mock_run.call_count == 5
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
@@ -811,6 +822,24 @@ class TestInjectAuth:
         # First subprocess.run call copies PEM content via stdin
         first_call = mock_run.call_args_list[0]
         assert "BEGIN RSA PRIVATE KEY" in first_call[1]["input"]
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_codex_access_token_is_consumed_not_stored(self, mock_ssh, mock_run, tmp_path):
+        from provision import inject_auth
+
+        mock_ssh.return_value = "/usr/bin/gh"
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        config = self._config(tmp_path)
+        config["CODEX_ACCESS_TOKEN"] = "codex-access-token"
+
+        inject_auth("1.2.3.4", config)
+
+        login_call = mock_run.call_args_list[-1]
+        assert "codex login --with-access-token" in login_call[0][0][-1]
+        assert login_call[1]["input"] == "codex-access-token"
+        all_commands = "\n".join(call[0][0][-1] for call in mock_run.call_args_list)
+        assert "CODEX_ACCESS_TOKEN" not in all_commands
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")
