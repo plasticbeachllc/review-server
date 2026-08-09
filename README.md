@@ -153,9 +153,14 @@ GITHUB_WEBHOOK_SECRET=                            # ← auto-populated in Step 2
 
 # ── Codex reviewer ───────────────────────────────
 REVIEW_ENGINE=codex                                # leave as-is
+CODEX_MODEL=gpt-5.6-terra                           # recommended ChatGPT-backed model
 CODEX_SANDBOX=read-only                            # leave as-is
 CODEX_APPROVAL_POLICY=never                        # leave as-is
 CODEX_WEB_SEARCH=disabled                          # leave as-is
+# CODEX_TIMEOUT_SECONDS=300                         # optional: review time limit
+# CODEX_EPHEMERAL=1                                # optional: do not persist Codex sessions
+# CODEX_IGNORE_USER_CONFIG=1                        # optional: ignore the review user's Codex config
+# CODEX_IGNORE_RULES=1                              # optional: ignore repository/user rules
 # CODEX_ACCESS_TOKEN=                              # optional one-time login seed
 
 # ── Cloudflare ───────────────────────────────────
@@ -305,6 +310,14 @@ After editing, deploy with `just deploy root@<server-ip>`.
 | Setting | Where | Default |
 |---------|-------|---------|
 | Review prompt | `src/prompt.md` | Correctness + security + performance |
+| Reviewer engine | `REVIEW_ENGINE` in `.env` | `codex` |
+| Codex model | `CODEX_MODEL` in `.env` | `gpt-5.6-terra` in `.env.example`; Codex CLI default when unset |
+| Codex sandbox | `CODEX_SANDBOX` in `.env` | `read-only` |
+| Codex approval policy | `CODEX_APPROVAL_POLICY` in `.env` | `never` |
+| Codex web search | `CODEX_WEB_SEARCH` in `.env` | `disabled` |
+| Codex timeout | `CODEX_TIMEOUT_SECONDS` in `.env` | 300 seconds |
+| Isolate Codex sessions | `CODEX_EPHEMERAL` in `.env` | enabled |
+| Ignore Codex configuration and rules | `CODEX_IGNORE_USER_CONFIG`, `CODEX_IGNORE_RULES` in `.env` | enabled |
 | Concurrent reviews | `MAX_WORKERS` in `.env` | 4 |
 | Diff size limit | `max_chars` in `smart_truncate_diff()` | 40,000 chars |
 | File contents limit | `MAX_FILE_CHARS` in `.env` | 80,000 chars |

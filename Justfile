@@ -48,7 +48,7 @@ status:
 
 # Run tests
 test:
-    uv run pytest tests/ -v
+    uv run --group dev python -m pytest tests/ -v
 
 # Clean build artifacts
 clean:
