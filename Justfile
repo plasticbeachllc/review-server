@@ -18,20 +18,40 @@ validate: build
     fi
     cloud-init schema --config-file cloud-init.yaml
 
-# Deploy agent files to a running server (requires root SSH access, e.g. `root@<ip>`)
-deploy host:
-    scp src/agent.py src/prompt.md {{host}}:/opt/pr-review/
-    ssh {{host}} 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md && systemctl restart pr-review'
-    @echo "✓ Deployed and restarted on {{host}}"
+# Deploy agent files to a running server. The host is auto-discovered when omitted.
+deploy host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target='{{host}}'
+    if [[ -z "$target" ]]; then target="$(uv run python scripts/status.py --ssh-target)"; fi
+    scp src/agent.py src/prompt.md "$target":/opt/pr-review/
+    ssh "$target" 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md && systemctl restart pr-review'
+    echo "✓ Deployed and restarted on $target"
 
 # Log Codex in with ChatGPT/device auth as the review service user
-codex-login host:
-    ssh -t {{host}} 'install -d -m 700 -o review -g review /home/review/.codex && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex login --device-auth && systemctl restart pr-review'
-    @echo "✓ Codex login complete and pr-review restarted on {{host}}"
+codex-login host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target='{{host}}'
+    if [[ -z "$target" ]]; then target="$(uv run python scripts/status.py --ssh-target)"; fi
+    ssh -t "$target" 'install -d -m 700 -o review -g review /home/review/.codex && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex login --device-auth && systemctl restart pr-review'
+    echo "✓ Codex login complete and pr-review restarted on $target"
 
 # Smoke-test Codex as the review service user
-codex-smoke host:
-    ssh -n {{host}} 'cd /opt/pr-review && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex --sandbox read-only --ask-for-approval never exec --skip-git-repo-check --ignore-user-config --ignore-rules "Respond with exactly OK."'
+codex-smoke host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target='{{host}}'
+    if [[ -z "$target" ]]; then target="$(uv run python scripts/status.py --ssh-target)"; fi
+    ssh -n "$target" 'cd /opt/pr-review && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex --sandbox read-only --ask-for-approval never exec --skip-git-repo-check --ignore-user-config --ignore-rules "Respond with exactly OK."'
+
+# Tail service logs. The host is auto-discovered when omitted.
+logs host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target='{{host}}'
+    if [[ -z "$target" ]]; then target="$(uv run python scripts/status.py --ssh-target)"; fi
+    ssh -t "$target" 'journalctl -u pr-review -f'
 
 # Provision a new server (build + create + configure — fully automated)
 provision:

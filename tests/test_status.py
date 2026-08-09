@@ -19,6 +19,50 @@ class TestStatusHealthCheck:
         server.created.isoformat.return_value = "2025-01-01T00:00:00+00:00"
         return server
 
+    @patch("status.ssh")
+    @patch("status.Client")
+    @patch("status.load_config")
+    def test_ssh_target_prints_target_without_health_checks(
+        self, mock_config, MockClient, mock_ssh, capsys,
+    ):
+        from status import main
+
+        mock_config.return_value = {
+            "SERVER_NAME": "pr-review",
+            "HCLOUD_TOKEN": "tok",
+        }
+        MockClient.return_value.servers.get_by_name.return_value = self._make_server()
+
+        main(["--ssh-target"])
+
+        assert capsys.readouterr().out == "root@1.2.3.4\n"
+        mock_ssh.assert_not_called()
+
+    @patch("status.ssh")
+    @patch("status.Client")
+    @patch("status.load_config")
+    def test_ssh_target_rejects_non_running_server(
+        self, mock_config, MockClient, mock_ssh, capsys,
+    ):
+        from status import main
+
+        mock_config.return_value = {
+            "SERVER_NAME": "pr-review",
+            "HCLOUD_TOKEN": "tok",
+        }
+        MockClient.return_value.servers.get_by_name.return_value = self._make_server(
+            status="initializing",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            main(["--ssh-target"])
+
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "ERROR: Server 'pr-review' is 'initializing', not running.\n"
+        mock_ssh.assert_not_called()
+
     @patch("status.requests.get")
     @patch("status.ssh")
     @patch("status.Client")

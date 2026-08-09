@@ -12,6 +12,7 @@ Exit codes:
 
 Usage:
     python3 scripts/status.py
+    python3 scripts/status.py --ssh-target
     just status
 """
 
@@ -27,7 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import ProvisionError, load_config, ssh  # noqa: E402
 
 
-def main():
+def main(argv: list[str] | None = None):
+    argv = [] if argv is None else argv
+    if argv not in ([], ["--ssh-target"]):
+        print("Usage: status.py [--ssh-target]", file=sys.stderr)
+        sys.exit(64)
+
     root = Path(__file__).resolve().parent.parent
 
     try:
@@ -45,6 +51,16 @@ def main():
         sys.exit(3)  # exit 3 = not found
 
     ip = server.public_net.ipv4.ip
+    if argv == ["--ssh-target"]:
+        if server.status != "running":
+            print(
+                f"ERROR: Server '{name}' is '{server.status}', not running.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"root@{ip}")
+        return
+
     print(f"Server:   {name} (id={server.id})")
     print(f"Status:   {server.status}")
     print(f"IP:       {ip}")
@@ -108,4 +124,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
