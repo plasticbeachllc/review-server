@@ -52,6 +52,12 @@ def main(argv: list[str] | None = None):
 
     ip = server.public_net.ipv4.ip
     if argv == ["--ssh-target"]:
+        if server.status != "running":
+            print(
+                f"ERROR: Server '{name}' is '{server.status}', not running.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(f"root@{ip}")
         return
 
