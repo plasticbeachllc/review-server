@@ -334,6 +334,127 @@ def is_low_priority(filename: str) -> bool:
     return any(re.search(p, filename) for p in LOW_PRIORITY_PATTERNS)
 
 
+def _pull_files_payload_to_diff(payload: object) -> tuple[str, int]:
+    """Build a unified-diff-like string from GitHub's pull-files response.
+
+    ``gh api --paginate --slurp`` returns a list of pages, where each page is
+    a list of file objects.  A flat list is accepted as well to keep this
+    helper tolerant of callers that already flattened the response.
+
+    GitHub omits ``patch`` for binary files and some very large files.  Keep a
+    small metadata-only chunk for those files so the reviewer is told that the
+    change exists instead of silently losing it.
+    """
+    if not isinstance(payload, list):
+        raise ValueError("pull-files response is not a list")
+
+    entries: list[object] = []
+    for page in payload:
+        if isinstance(page, list):
+            entries.extend(page)
+        else:
+            entries.append(page)
+
+    chunks: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        filename = entry.get("filename")
+        if not isinstance(filename, str) or not filename:
+            continue
+
+        # Prevent unusual Git filenames from injecting extra synthetic diff
+        # lines. Normal paths are unchanged.
+        filename = filename.replace("\r", "\\r").replace("\n", "\\n")
+        previous = entry.get("previous_filename")
+        if not isinstance(previous, str) or not previous:
+            previous = filename
+        else:
+            previous = previous.replace("\r", "\\r").replace("\n", "\\n")
+
+        status = entry.get("status")
+        if not isinstance(status, str):
+            status = "modified"
+
+        old_path = "/dev/null" if status == "added" else f"a/{previous}"
+        new_path = "/dev/null" if status == "removed" else f"b/{filename}"
+        lines = [
+            f"diff --git a/{previous} b/{filename}\n",
+            f"--- {old_path}\n",
+            f"+++ {new_path}\n",
+        ]
+
+        patch = entry.get("patch")
+        if isinstance(patch, str) and patch:
+            lines.append(patch)
+            if not patch.endswith("\n"):
+                lines.append("\n")
+        else:
+            additions = entry.get("additions", "unknown")
+            deletions = entry.get("deletions", "unknown")
+            lines.append(
+                "[Patch unavailable from GitHub API: "
+                f"status={status}, additions={additions}, deletions={deletions}]\n"
+            )
+
+        chunks.append("".join(lines))
+
+    if not chunks:
+        raise ValueError("pull-files response contains no usable file entries")
+    return "".join(chunks), len(chunks)
+
+
+def fetch_pr_diff(repo: str, pr_number: int) -> str | None:
+    """Fetch a PR diff, falling back when GitHub's diff endpoint is capped.
+
+    GitHub rejects the normal pull-request diff when more than 300 files are
+    changed.  The pull-files REST endpoint remains available (up to GitHub's
+    higher API cap), so paginate that endpoint and reconstruct file chunks for
+    the existing prioritization and truncation pipeline.
+    """
+    diff_result = subprocess.run(
+        ["gh", "pr", "diff", str(pr_number), "--repo", repo],
+        capture_output=True, text=True, timeout=60, env=_gh_env(),
+    )
+    if diff_result.returncode == 0:
+        return diff_result.stdout
+
+    primary_error = diff_result.stderr.strip()
+    log.warning(
+        f"gh pr diff failed for {repo}#{pr_number}; "
+        "trying paginated pull-files API"
+    )
+    files_result = subprocess.run(
+        ["gh", "api", "--paginate", "--slurp",
+         f"repos/{repo}/pulls/{pr_number}/files?per_page=100"],
+        capture_output=True, text=True, timeout=120, env=_gh_env(),
+    )
+    if files_result.returncode != 0:
+        log.error(
+            f"Unable to fetch diff for {repo}#{pr_number}: "
+            f"gh pr diff: {primary_error or 'unknown error'}; "
+            f"pull-files API: {files_result.stderr.strip() or 'unknown error'}"
+        )
+        return None
+
+    try:
+        payload = json.loads(files_result.stdout)
+        diff, file_count = _pull_files_payload_to_diff(payload)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.error(
+            f"Unable to reconstruct diff for {repo}#{pr_number} from "
+            f"pull-files API: {e}"
+        )
+        return None
+
+    log.info(
+        f"Reconstructed diff for {repo}#{pr_number} from "
+        f"{file_count} pull-files API entries"
+    )
+    return diff
+
+
 def smart_truncate_diff(diff: str, max_chars: int = 40_000) -> tuple[str, str]:
     """Truncate diff by dropping low-priority files first, then large files."""
     if len(diff) <= max_chars:
@@ -653,12 +774,8 @@ def review_pr(
         if action in ("synchronize", "ready_for_review"):
             collapse_old_reviews(repo, pr_number)
 
-        diff_result = subprocess.run(
-            ["gh", "pr", "diff", str(pr_number), "--repo", repo],
-            capture_output=True, text=True, timeout=60, env=_gh_env(),
-        )
-        if diff_result.returncode != 0:
-            log.error(f"gh pr diff failed: {diff_result.stderr}")
+        raw_diff = fetch_pr_diff(repo, pr_number)
+        if raw_diff is None:
             return
 
         # Fetch PR metadata (body + head SHA) in one call
@@ -677,7 +794,7 @@ def review_pr(
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-        diff, truncation_note = smart_truncate_diff(diff_result.stdout)
+        diff, truncation_note = smart_truncate_diff(raw_diff)
 
         if not diff.strip():
             log.warning(f"Empty diff for {pr_key}")
@@ -686,7 +803,7 @@ def review_pr(
         # Fetch full contents of changed files for richer context
         file_section = ""
         if head_sha:
-            filenames = extract_diff_filenames(diff_result.stdout)
+            filenames = extract_diff_filenames(raw_diff)
             fetchable = [f for f in filenames if not is_low_priority(f)]
             raw_files = fetch_file_contents(repo, head_sha, fetchable)
             file_contents_str, file_note = format_file_contents(

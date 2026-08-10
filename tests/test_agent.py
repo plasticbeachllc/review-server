@@ -56,6 +56,7 @@ from agent import (
     collapse_old_reviews,
     extract_diff_filenames,
     fetch_file_contents,
+    fetch_pr_diff,
     format_file_contents,
     is_low_priority,
     review_pr,
@@ -146,6 +147,104 @@ class TestInstallationToken:
             with _token_lock:
                 _token_cache.token = ""
                 _token_cache.expires_at = 0.0
+
+
+# ── PR diff fetching ────────────────────────────────────
+
+
+class TestFetchPrDiff:
+    @patch("agent.subprocess.run")
+    def test_returns_normal_diff_without_fallback(self, mock_run):
+        mock_run.return_value = _subprocess_result(
+            stdout="diff --git a/app.py b/app.py\n+change\n",
+        )
+
+        diff = fetch_pr_diff("owner/repo", 42)
+
+        assert diff == "diff --git a/app.py b/app.py\n+change\n"
+        assert mock_run.call_count == 1
+
+    @patch("agent.subprocess.run")
+    def test_falls_back_to_paginated_pull_files(self, mock_run):
+        pages = [[
+            {
+                "filename": "src/app.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1 +1 @@\n-old\n+new",
+            },
+            {
+                "filename": "assets/logo.png",
+                "status": "added",
+                "additions": 0,
+                "deletions": 0,
+            },
+        ]]
+        mock_run.side_effect = [
+            _subprocess_result(
+                returncode=1,
+                stderr="HTTP 406: diff exceeded 300 files\nPullRequest.diff too_large",
+            ),
+            _subprocess_result(stdout=json.dumps(pages)),
+        ]
+
+        diff = fetch_pr_diff("owner/repo", 42)
+
+        assert diff is not None
+        assert "diff --git a/src/app.py b/src/app.py" in diff
+        assert "@@ -1 +1 @@\n-old\n+new" in diff
+        assert "--- /dev/null\n+++ b/assets/logo.png" in diff
+        assert "Patch unavailable from GitHub API" in diff
+        fallback_args = mock_run.call_args_list[1][0][0]
+        assert fallback_args[:4] == ["gh", "api", "--paginate", "--slurp"]
+        assert fallback_args[-1] == "repos/owner/repo/pulls/42/files?per_page=100"
+
+    @patch("agent.subprocess.run")
+    def test_fallback_preserves_renames_and_deletions(self, mock_run):
+        pages = [[
+            {
+                "filename": "new.py",
+                "previous_filename": "old.py",
+                "status": "renamed",
+                "patch": "@@ -1 +1 @@\n-old\n+new",
+            },
+            {
+                "filename": "removed.py",
+                "status": "removed",
+                "patch": "@@ -1 +0,0 @@\n-gone",
+            },
+        ]]
+        mock_run.side_effect = [
+            _subprocess_result(returncode=1, stderr="too large"),
+            _subprocess_result(stdout=json.dumps(pages)),
+        ]
+
+        diff = fetch_pr_diff("owner/repo", 7)
+
+        assert diff is not None
+        assert "diff --git a/old.py b/new.py" in diff
+        assert "--- a/removed.py\n+++ /dev/null" in diff
+        assert extract_diff_filenames(diff) == ["new.py"]
+
+    @patch("agent.subprocess.run")
+    def test_returns_none_when_both_sources_fail(self, mock_run):
+        mock_run.side_effect = [
+            _subprocess_result(returncode=1, stderr="primary failed"),
+            _subprocess_result(returncode=1, stderr="fallback failed"),
+        ]
+
+        assert fetch_pr_diff("owner/repo", 42) is None
+        assert mock_run.call_count == 2
+
+    @patch("agent.subprocess.run")
+    def test_returns_none_for_invalid_fallback_json(self, mock_run):
+        mock_run.side_effect = [
+            _subprocess_result(returncode=1, stderr="primary failed"),
+            _subprocess_result(stdout="not-json"),
+        ]
+
+        assert fetch_pr_diff("owner/repo", 42) is None
 
 
 class TestReviewerCommand:
@@ -1103,18 +1202,54 @@ class TestReviewPr:
         assert "Updated Review" in comment_args[body_idx]
 
     @patch("agent.subprocess.run")
-    def test_returns_on_diff_failure(self, mock_run):
+    def test_returns_when_both_diff_sources_fail(self, mock_run):
         mock_run.side_effect = [
             # already_reviewed
             _subprocess_result(stdout="0\n"),
             # gh pr diff — fails
             _subprocess_result(returncode=1, stderr="not found"),
+            # paginated pull-files API — also fails
+            _subprocess_result(returncode=1, stderr="API unavailable"),
         ]
 
         self._call_review("owner/repo", 1, "Fix", "opened")
 
-        # Should stop after diff failure — no reviewer or comment calls
-        assert mock_run.call_count == 2
+        # Should stop after both diff sources fail — no reviewer or comment calls
+        assert mock_run.call_count == 3
+
+    @patch("agent.subprocess.Popen")
+    @patch("agent.subprocess.run")
+    @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
+    def test_reviews_large_pr_via_pull_files_fallback(
+        self, mock_template, mock_run, mock_popen,
+    ):
+        pages = [[{
+            "filename": "src/large_pr.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "patch": "@@ -1 +1 @@\n-old\n+new",
+        }]]
+        mock_run.side_effect = [
+            _subprocess_result(stdout="0\n"),  # already_reviewed
+            _subprocess_result(                 # gh pr diff hits 300-file cap
+                returncode=1,
+                stderr="PullRequest.diff too_large",
+            ),
+            _subprocess_result(stdout=json.dumps(pages)),  # pull-files fallback
+            _subprocess_result(stdout='{"body":"Large PR"}\n'),  # PR metadata
+            _subprocess_result(),  # comment
+        ]
+        mock_popen.return_value = self._mock_reviewer("Found one issue.")
+
+        self._call_review("owner/repo", 42, "Large change", "opened")
+
+        mock_popen.assert_called_once()
+        reviewer_prompt = mock_popen.call_args[0][0][-1]
+        assert "src/large_pr.py" in reviewer_prompt
+        assert "+new" in reviewer_prompt
+        assert _find_call_with_arg(mock_run, "--paginate") is not None
+        assert _find_call_with_arg(mock_run, "--body") is not None
 
     @patch("agent.subprocess.run")
     @patch("agent.get_prompt_template", return_value="{repo}#{pr_number}: {pr_title}\n{pr_body}\n{truncation_note}\n{file_contents}\n{diff}")
