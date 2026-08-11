@@ -28,14 +28,13 @@ deploy host="":
     ssh "$target" 'chown review:review /opt/pr-review/agent.py /opt/pr-review/prompt.md && systemctl restart pr-review'
     echo "✓ Deployed and restarted on $target"
 
-# Log Codex in with ChatGPT/device auth as the review service user
-codex-login host="":
+# Log Codex in using `chatgpt` or `api-key` (defaults to CODEX_AUTH_MODE in .env)
+codex-login mode="" host="":
     #!/usr/bin/env bash
     set -euo pipefail
     target='{{host}}'
     if [[ -z "$target" ]]; then target="$(uv run python scripts/status.py --ssh-target)"; fi
-    ssh -t "$target" 'install -d -m 700 -o review -g review /home/review/.codex && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex login --device-auth && systemctl restart pr-review'
-    echo "✓ Codex login complete and pr-review restarted on $target"
+    uv run python scripts/codex_login.py "$target" --mode '{{mode}}'
 
 # Smoke-test Codex as the review service user
 codex-smoke host="":
@@ -43,7 +42,7 @@ codex-smoke host="":
     set -euo pipefail
     target='{{host}}'
     if [[ -z "$target" ]]; then target="$(uv run python scripts/status.py --ssh-target)"; fi
-    ssh -n "$target" 'cd /opt/pr-review && sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex --sandbox read-only --ask-for-approval never exec --skip-git-repo-check --ignore-user-config --ignore-rules "Respond with exactly OK."'
+    ssh -n "$target" 'set -eu; cd /opt/pr-review; mode=$(sed -n "s/^CODEX_AUTH_MODE=//p" .env | tail -n 1); model=$(sed -n "s/^CODEX_MODEL=//p" .env | tail -n 1); case "${mode:-chatgpt}" in chatgpt) forced=chatgpt ;; api-key) forced=api ;; *) echo "Invalid CODEX_AUTH_MODE: $mode" >&2; exit 1 ;; esac; args=(--sandbox read-only --ask-for-approval never exec --skip-git-repo-check -c "forced_login_method=\"$forced\"" --ignore-user-config --ignore-rules); if [[ -n "$model" ]]; then args+=(--model "$model"); fi; sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex codex "${args[@]}" "Respond with exactly OK."'
 
 # Tail service logs. The host is auto-discovered when omitted.
 logs host="":

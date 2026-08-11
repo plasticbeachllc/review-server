@@ -50,6 +50,7 @@ class TestLoadConfig:
         assert config["SERVER_TYPE"] == "cax11"
         assert config["SERVER_LOCATION"] == "nbg1"
         assert config["SERVER_IMAGE"] == "ubuntu-24.04"
+        assert config["CODEX_AUTH_MODE"] == "chatgpt"
 
     def test_overrides_defaults(self, tmp_path):
         from _common import load_config
@@ -840,6 +841,41 @@ class TestInjectAuth:
         assert login_call[1]["input"] == "codex-access-token"
         all_commands = "\n".join(call[0][0][-1] for call in mock_run.call_args_list)
         assert "CODEX_ACCESS_TOKEN" not in all_commands
+
+    @patch("provision.subprocess.run")
+    @patch("provision.ssh")
+    def test_api_key_is_consumed_not_stored(self, mock_ssh, mock_run, tmp_path):
+        from provision import inject_auth
+
+        mock_ssh.return_value = "/usr/bin/gh"
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        config = self._config(tmp_path)
+        config.update({
+            "CODEX_AUTH_MODE": "api-key",
+            "OPENAI_API_KEY": "sk-project-test",
+        })
+
+        inject_auth("1.2.3.4", config)
+
+        login_call = mock_run.call_args_list[-1]
+        assert "codex login --with-api-key" in login_call[0][0][-1]
+        assert login_call[1]["input"] == "sk-project-test"
+        all_commands = "\n".join(call[0][0][-1] for call in mock_run.call_args_list)
+        assert "sk-project-test" not in all_commands
+
+    def test_api_key_mode_requires_key(self):
+        from _common import ProvisionError
+        from provision import _validate_codex_auth
+
+        with pytest.raises(ProvisionError, match="requires OPENAI_API_KEY"):
+            _validate_codex_auth({"CODEX_AUTH_MODE": "api-key"})
+
+    def test_rejects_invalid_codex_auth_mode(self):
+        from _common import ProvisionError
+        from provision import _validate_codex_auth
+
+        with pytest.raises(ProvisionError, match="must be 'chatgpt' or 'api-key'"):
+            _validate_codex_auth({"CODEX_AUTH_MODE": "other"})
 
     @patch("provision.subprocess.run")
     @patch("provision.ssh")

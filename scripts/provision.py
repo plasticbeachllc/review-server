@@ -320,6 +320,25 @@ def create_server(client: Client, config: dict, ssh_key: SSHKey, cloud_init: str
 # ---------------------------------------------------------------------------
 # Auth injection
 # ---------------------------------------------------------------------------
+def _codex_auth_mode(config: dict) -> str:
+    """Return and validate the configured Codex authentication mode."""
+    mode = config.get("CODEX_AUTH_MODE", "chatgpt").strip().lower()
+    if mode not in ("chatgpt", "api-key"):
+        raise ProvisionError("CODEX_AUTH_MODE must be 'chatgpt' or 'api-key'")
+    return mode
+
+
+def _validate_codex_auth(config: dict):
+    """Fail before provisioning when an explicit API-key setup is incomplete."""
+    if config.get("REVIEW_ENGINE", "codex").strip().lower() != "codex":
+        return
+    mode = _codex_auth_mode(config)
+    if mode == "api-key" and not config.get("OPENAI_API_KEY", "").strip():
+        raise ProvisionError(
+            "CODEX_AUTH_MODE=api-key requires OPENAI_API_KEY in .env or the environment"
+        )
+
+
 def _upsert_env_var(ip: str, key: str, value: str, *, label: str = ""):
     """Upsert a single key=value into the server's /opt/pr-review/.env.
 
@@ -377,27 +396,38 @@ def deploy_agent_files(ip: str, root: Path):
 
 
 def _maybe_login_codex(ip: str, config: dict):
-    """Seed Codex ChatGPT auth for the review user when configured.
+    """Seed the selected Codex auth method for the review user.
 
-    CODEX_ACCESS_TOKEN is consumed over stdin and is not written to the
-    service env file. If absent, the user can run ``codex login`` manually
-    as the ``review`` user after provisioning.
+    Login secrets are consumed over stdin and are not written to the service
+    env file. ChatGPT mode may be completed manually after provisioning when
+    no access token is configured; API-key mode requires a key up front.
     """
     if config.get("REVIEW_ENGINE", "codex").strip().lower() != "codex":
         return
 
-    token = config.get("CODEX_ACCESS_TOKEN", "").strip()
-    if not token:
+    mode = _codex_auth_mode(config)
+    if mode == "api-key":
+        secret = config.get("OPENAI_API_KEY", "").strip()
+        login_flag = "--with-api-key"
+    else:
+        secret = config.get("CODEX_ACCESS_TOKEN", "").strip()
+        login_flag = "--with-access-token"
+
+    if not secret and mode == "chatgpt":
         print("  Codex access token not set; run Codex login manually after provisioning")
         return
+    if not secret:
+        raise ProvisionError(
+            "CODEX_AUTH_MODE=api-key requires OPENAI_API_KEY in .env or the environment"
+        )
 
-    print("  Seeding Codex login for review user...")
+    print(f"  Seeding Codex {mode} login for review user...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"root@{ip}",
          "install -d -m 700 -o review -g review /home/review/.codex && "
-         "sudo -u review env CODEX_HOME=/home/review/.codex "
-         "codex login --with-access-token"],
-        input=token, capture_output=True, text=True, timeout=60,
+         "sudo -u review env HOME=/home/review CODEX_HOME=/home/review/.codex "
+         f"codex login {login_flag}"],
+        input=secret, capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
         raise ProvisionError(
@@ -458,12 +488,13 @@ def inject_auth(ip: str, config: dict):
     _upsert_env_var(ip, "GITHUB_WEBHOOK_SECRET", config["GITHUB_WEBHOOK_SECRET"],
                     label="GITHUB_WEBHOOK_SECRET")
 
-    # Reviewer configuration. CODEX_ACCESS_TOKEN is intentionally excluded:
-    # if present, it is consumed once by _maybe_login_codex and never stored
-    # in the service env file where untrusted review prompts could reach it.
+    # Reviewer configuration. Auth secrets are intentionally excluded: they
+    # are consumed once by _maybe_login_codex and never stored in the service
+    # env file where untrusted review prompts could reach them.
     print("  Injecting reviewer configuration...")
     for key in (
         "REVIEW_ENGINE",
+        "CODEX_AUTH_MODE",
         "CODEX_MODEL",
         "CODEX_SANDBOX",
         "CODEX_APPROVAL_POLICY",
@@ -649,6 +680,11 @@ def main():
         # 1. Config
         print("[1/9] Loading configuration...")
         config = load_config(root)
+        for key in ("OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
+            value = os.environ.pop(key, "")
+            if value:
+                config[key] = value
+        _validate_codex_auth(config)
 
         # 2. Build cloud-init
         print("[2/9] Building cloud-init.yaml...")

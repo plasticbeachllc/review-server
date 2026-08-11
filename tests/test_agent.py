@@ -258,7 +258,14 @@ class TestReviewerCommand:
         assert cmd[cmd.index("--sandbox") + 1] == "read-only"
         assert cmd[cmd.index("--ask-for-approval") + 1] == "never"
         assert "web_search=\"disabled\"" in cmd
+        assert "forced_login_method=\"chatgpt\"" in cmd
         assert cmd[-1] == "Review this"
+
+    def test_codex_command_enforces_api_key_mode(self):
+        with patch("agent.CODEX_AUTH_MODE", "api-key"):
+            cmd = _codex_command("Review this")
+
+        assert "forced_login_method=\"api\"" in cmd
 
     def test_reviewer_command_defaults_to_codex(self):
         cmd = _reviewer_command("Review")
@@ -272,6 +279,7 @@ class TestReviewerCommand:
         monkeypatch.setenv("GH_APP_PRIVATE_KEY_FILE", "/secret.pem")
         monkeypatch.setenv("CODEX_ACCESS_TOKEN", "codex-access")
         monkeypatch.setenv("CODEX_API_KEY", "codex-api")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-api")
 
         env = _reviewer_env()
 
@@ -283,6 +291,7 @@ class TestReviewerCommand:
         assert "GH_APP_PRIVATE_KEY_FILE" not in env
         assert "CODEX_ACCESS_TOKEN" not in env
         assert "CODEX_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
 
 
 # ── verify_signature ─────────────────────────────────────

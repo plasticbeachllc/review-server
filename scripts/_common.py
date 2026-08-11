@@ -29,6 +29,7 @@ DEFAULTS = {
     "SERVER_TYPE": "cax11",
     "SERVER_LOCATION": "nbg1",
     "SERVER_IMAGE": "ubuntu-24.04",
+    "CODEX_AUTH_MODE": "chatgpt",
 }
 
 # SSH options for connecting to provisioned servers.

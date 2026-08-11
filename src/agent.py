@@ -63,6 +63,7 @@ MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "80000"))
 DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "10"))
 REVIEW_MARKER = "<!-- claude-review -->"
 REVIEW_ENGINE = os.environ.get("REVIEW_ENGINE", "codex").strip().lower()
+CODEX_AUTH_MODE = os.environ.get("CODEX_AUTH_MODE", "chatgpt").strip().lower()
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "").strip()
 CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "read-only").strip()
 CODEX_APPROVAL_POLICY = os.environ.get("CODEX_APPROVAL_POLICY", "never").strip()
@@ -79,6 +80,8 @@ _prompt_lock = threading.Lock()
 
 if REVIEW_ENGINE not in ("codex", "claude"):
     sys.exit("REVIEW_ENGINE must be 'codex' or 'claude'")
+if REVIEW_ENGINE == "codex" and CODEX_AUTH_MODE not in ("chatgpt", "api-key"):
+    sys.exit("CODEX_AUTH_MODE must be 'chatgpt' or 'api-key'")
 
 
 # ── GitHub App token management ──────────────────────────
@@ -684,6 +687,7 @@ def _codex_command(prompt: str) -> list[str]:
     The prompt is passed as a positional argument, not through shell
     interpolation.
     """
+    forced_login_method = "api" if CODEX_AUTH_MODE == "api-key" else "chatgpt"
     cmd = [
         "codex",
         "--sandbox", CODEX_SANDBOX,
@@ -691,6 +695,7 @@ def _codex_command(prompt: str) -> list[str]:
         "exec",
         "--skip-git-repo-check",
         "-c", f'web_search="{CODEX_WEB_SEARCH}"',
+        "-c", f'forced_login_method="{forced_login_method}"',
     ]
     if CODEX_EPHEMERAL:
         cmd.append("--ephemeral")
@@ -740,6 +745,7 @@ def _reviewer_env() -> dict[str, str]:
     env["CODEX_HOME"] = CODEX_HOME
     env.pop("CODEX_API_KEY", None)
     env.pop("CODEX_ACCESS_TOKEN", None)
+    env.pop("OPENAI_API_KEY", None)
     return env
 
 
